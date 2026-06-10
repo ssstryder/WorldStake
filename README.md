@@ -1,81 +1,81 @@
-# ⚽ Mundial 2026 — Apostas entre amigos
+# ⚽ WorldStake — FIFA World Cup 2026 Betting Tracker
 
-Site de apostas desportivas para o Mundial 2026, feito para usar entre amigos. Cada jogador começa com €10 e o objetivo é ver quem termina com mais dinheiro.
+A real-time betting tracker for friend groups during the 2026 FIFA World Cup. Each player starts with €10 and competes to finish with the most money.
 
-## Funcionalidades
+## Features
 
-- **Login por email e password** — cada amigo cria a sua conta
-- **Importar boletim por print** — tira uma screenshot do teu boletim do Betclic, Bet365, etc. e o Gemini AI lê automaticamente as apostas
-- **Leaderboard em tempo real** — classificação atualizada para toda a gente em simultâneo
-- **Histórico de apostas** — cada um vê as suas apostas e o histórico de saldo
-- **Vista de todos** — qualquer pessoa pode ver as apostas de todos (só leitura)
-- **Gráfico de evolução** — linha temporal do saldo de cada jogador ao longo do torneio
-- **Painel de admin** — o administrador resolve as apostas como ganhas ou perdidas
-- **Resolução automática** — integração com football-data.org via proxy para resolver apostas automaticamente quando os jogos terminam
+- **Email & password login** — each friend creates their own account
+- **AI-powered bet slip scanning** — take a screenshot of your Betclic, Bet365, etc. slip and Gemini AI reads the bets automatically
+- **Real-time leaderboard** — standings update live for everyone simultaneously
+- **Bet history** — each player sees their own bets and balance history
+- **All bets view** — anyone can see everyone's bets (read-only)
+- **Evolution chart** — timeline of each player's balance throughout the tournament
+- **Admin panel** — the administrator marks bets as won or lost
+- **Automatic resolution** — integration with football-data.org via proxy to resolve bets automatically when matches finish
 
 ## Stack
 
 - **Frontend:** HTML, CSS, JavaScript (ES Modules)
-- **Base de dados:** Firebase Firestore
-- **Autenticação:** Firebase Auth (email/password)
+- **Database:** Firebase Firestore
+- **Authentication:** Firebase Auth (email/password)
 - **Hosting:** Firebase Hosting
-- **AI para leitura de prints:** Google Gemini API
-- **Proxy para resultados:** Node.js no Render.com
+- **AI for bet slip reading:** Google Gemini API
+- **Results proxy:** Node.js on Render.com
 
 ---
 
-## Configuração
+## Setup
 
 ### 1. Firebase
 
-1. Cria um projeto em [console.firebase.google.com](https://console.firebase.google.com)
-2. Ativa **Authentication → Email/Password**
-3. Cria uma base de dados **Firestore** em modo de teste
-4. Vai a **Configurações do projeto → As tuas apps → Config** e copia os valores
+1. Create a project at [console.firebase.google.com](https://console.firebase.google.com)
+2. Enable **Authentication → Email/Password**
+3. Create a **Firestore** database in test mode
+4. Go to **Project settings → Your apps → Config** and copy the values
 
-No ficheiro `app.js`, substitui os placeholders:
+In `app.js`, replace the placeholders:
 
 ```js
 const firebaseConfig = {
-  apiKey:            "SUA_API_KEY",
-  authDomain:        "SEU_AUTH_DOMAIN",
-  projectId:         "SEU_PROJECT_ID",
-  storageBucket:     "SEU_STORAGE_BUCKET",
-  messagingSenderId: "SEU_MESSAGING_SENDER_ID",
-  appId:             "SEU_APP_ID"
+  apiKey:            "YOUR_API_KEY",
+  authDomain:        "YOUR_AUTH_DOMAIN",
+  projectId:         "YOUR_PROJECT_ID",
+  storageBucket:     "YOUR_STORAGE_BUCKET",
+  messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+  appId:             "YOUR_APP_ID"
 };
 ```
 
 ### 2. Admin
 
-Faz login no site uma vez, vai ao Firebase Console → Authentication → Users e copia o teu UID. Substitui em `app.js`:
+Log in to the site once, go to Firebase Console → Authentication → Users and copy your UID. Replace in `app.js`:
 
 ```js
-const ADMIN_UID = "SEU_UID_DE_ADMIN";
+const ADMIN_UID = "YOUR_ADMIN_UID";
 ```
 
 ### 3. Gemini API
 
-1. Regista-te em [aistudio.google.com](https://aistudio.google.com/apikey)
-2. Cria uma chave de API gratuita
-3. Substitui em `app.js`:
+1. Sign up at [aistudio.google.com](https://aistudio.google.com/apikey)
+2. Create a free API key
+3. Replace in `app.js`:
 
 ```js
-const GEMINI_API_KEY = "SUA_CHAVE_GEMINI";
+const GEMINI_API_KEY = "YOUR_GEMINI_API_KEY";
 ```
 
-### 4. Proxy para resultados (Render.com)
+### 4. Results Proxy (Render.com)
 
-O proxy resolve o problema de CORS ao chamar a football-data.org a partir do browser.
+The proxy solves the CORS issue when calling football-data.org from the browser.
 
-1. Regista-te em [football-data.org](https://www.football-data.org) para obteres uma chave gratuita
-2. Cria um repositório no GitHub com os ficheiros da pasta `render_proxy/`
-3. Em [render.com](https://render.com), cria um **Web Service** ligado a esse repositório
-4. Adiciona a variável de ambiente: `FOOTBALL_API_KEY` = a tua chave
-5. Copia o URL do serviço (ex: `https://mundial-proxy-xxxx.onrender.com`) e substitui em `app.js`:
+1. Sign up at [football-data.org](https://www.football-data.org) for a free API key
+2. Create a GitHub repository with the files from the `render_proxy/` folder
+3. On [render.com](https://render.com), create a **Web Service** linked to that repository
+4. Add the environment variable: `FOOTBALL_API_KEY` = your key
+5. Copy the service URL (e.g. `https://your-proxy.onrender.com`) and replace in `app.js`:
 
 ```js
-const PROXY_URL = "https://SEU_PROXY.onrender.com";
+const PROXY_URL = "https://YOUR_PROXY.onrender.com";
 ```
 
 ### 5. Deploy
@@ -88,7 +88,7 @@ firebase deploy
 
 ---
 
-## Regras do Firestore (recomendado)
+## Firestore Rules (recommended)
 
 ```
 rules_version = '2';
@@ -102,7 +102,7 @@ service cloud.firestore {
       allow read: if request.auth != null;
       allow create: if request.auth != null && request.resource.data.uid == request.auth.uid;
       allow update: if request.auth != null &&
-        (resource.data.uid == request.auth.uid || request.auth.uid == "SEU_UID_DE_ADMIN");
+        (resource.data.uid == request.auth.uid || request.auth.uid == "YOUR_ADMIN_UID");
     }
   }
 }
@@ -110,23 +110,23 @@ service cloud.firestore {
 
 ---
 
-## Estrutura de ficheiros
+## File Structure
 
 ```
-├── index.html          # Estrutura HTML
-├── style.css           # Estilos
-├── app.js              # Lógica JavaScript + Firebase
-├── firebase.json       # Configuração Firebase Hosting
+├── index.html          # HTML structure
+├── style.css           # Styles
+├── app.js              # JavaScript logic + Firebase
+├── firebase.json       # Firebase Hosting config
 ├── render_proxy/
-│   ├── server.js       # Proxy Node.js para football-data.org
+│   ├── server.js       # Node.js proxy for football-data.org
 │   └── package.json
 └── README.md
 ```
 
 ---
 
-## Notas
+## Notes
 
-- O plano gratuito do Render adormece após 15 minutos de inatividade — a primeira visita do dia pode demorar ~30 segundos a carregar os jogos
-- A chave Gemini gratuita tem limite de 15 pedidos por minuto — suficiente para uso entre amigos
-- A football-data.org gratuita tem limite de 10 pedidos por minuto
+- Render's free plan sleeps after 15 minutes of inactivity — the first visit of the day may take ~30 seconds to load match data
+- The free Gemini API key has a limit of 15 requests per minute — more than enough for friend groups
+- The free football-data.org plan has a limit of 10 requests per minute
