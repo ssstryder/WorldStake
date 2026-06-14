@@ -1,15 +1,15 @@
 import { initializeApp } from "firebase/app";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged, signOut, updateProfile } from "firebase/auth";
-import { getFirestore, doc, setDoc, getDoc, updateDoc, collection, onSnapshot, deleteDoc, serverTimestamp } from "firebase/firestore";
+import { getFirestore, doc, setDoc, getDoc, updateDoc, collection, onSnapshot, deleteDoc, serverTimestamp, getDocs, query, orderBy, limit } from "firebase/firestore";
 
 // ─── CONFIGURAÇÃO FIREBASE ────────────────────────────────────────────────
 const firebaseConfig = {
-  apiKey:            "SUA_API_KEY",
-  authDomain:        "SEU_AUTH_DOMAIN",
-  projectId:         "SEU_PROJECT_ID",
-  storageBucket:     "SEU_STORAGE_BUCKET",
-  messagingSenderId: "SEU_MESSAGING_SENDER_ID",
-  appId:             "SEU_APP_ID"
+  apiKey:            "YOUR_API_KEY",
+  authDomain:        "YOUR_AUTH_DOMAIN",
+  projectId:         "YOUR_PROJECT_ID",
+  storageBucket:     "YOUR_STORAGE_BUCKET",
+  messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+  appId:             "YOUR_APP_ID"
 };
 
 const app  = initializeApp(firebaseConfig);
@@ -19,8 +19,8 @@ const db   = getFirestore(app);
 // ─── CONSTANTES ───────────────────────────────────────────────────────────
 const SALDO_INICIAL = 10.00;
 const ADMIN_UID     = "SEU_UID_DE_ADMIN";
-const PROXY_URL     = "https://SEU_PROXY.onrender.com";
-const GEMINI_API_KEY = "SUA_CHAVE_GEMINI";
+const PROXY_URL = "https://YOUR_PROXY.onrender.com";
+const GEMINI_API_KEY     = "YOUR_GEMINI_API_KEY";
 const $ = id => document.getElementById(id);
 const fmt    = v => (v >= 0 ? "+" : "") + v.toFixed(2) + " €";
 const fmtAbs = v => v.toFixed(2) + " €";
@@ -131,32 +131,62 @@ async function resolverApostasAuto(jogos) {
   const terminados = jogos.filter(j => j.status === "FINISHED");
   if (!terminados.length) return;
 
-  const pendentes = Object.values(allApostas).filter(a => a.estado === "pendente" && a.jogoId);
+  const pendentes = Object.values(allApostas).filter(a => a.estado === "pendente");
   if (!pendentes.length) return;
 
   for (const aposta of pendentes) {
-    const jogo = terminados.find(j => j.id === aposta.jogoId);
-    if (!jogo) continue;
+    if (!aposta.apostas || !Array.isArray(aposta.apostas)) continue;
 
-    const resultado = jogo.golsCasa > jogo.golsFora ? "casa"
-                    : jogo.golsFora > jogo.golsCasa ? "fora"
-                    : "empate";
-    const ganhou = aposta.previsaoSimples === resultado;
-    const lucro  = ganhou
-      ? +(aposta.valor * aposta.odd - aposta.valor).toFixed(2)
-      : +(-aposta.valor).toFixed(2);
+    // Atualiza estado de cada seleção individualmente
+    let todasResolvidas = true;
+    let algumaPerdida   = false;
+    const apostasAtualizadas = aposta.apostas.map(sel => {
+      if (!sel.jogoId) { todasResolvidas = false; return sel; }
+      const jogo = terminados.find(j => j.id === sel.jogoId);
+      if (!jogo) { todasResolvidas = false; return sel; }
 
-    await updateDoc(doc(db, "apostas", aposta.id), {
-      estado: ganhou ? "ganha" : "perdida",
-      lucro,
-      resolvidaEm: serverTimestamp()
+      // Determina se a seleção ganhou (simplificado: vitória casa/fora/empate)
+      const resultado = jogo.golsCasa > jogo.golsFora ? "casa"
+                      : jogo.golsFora > jogo.golsCasa ? "fora"
+                      : "empate";
+      const previsaoNorm = (sel.previsao || "").toLowerCase();
+      let ganhouSel = false;
+      if (previsaoNorm.includes("empate")) ganhouSel = resultado === "empate";
+      else if (previsaoNorm.includes("não") || previsaoNorm.includes("nao")) {
+        // "Não ambas marcam" etc — admin resolve manualmente
+        todasResolvidas = false;
+        return sel;
+      } else {
+        const casa = (sel.casaReal || sel.jogo.split(" vs ")[0] || "").toLowerCase();
+        ganhouSel = resultado === "casa"
+          ? previsaoNorm.includes(casa)
+          : resultado === "fora";
+      }
+
+      if (!ganhouSel) algumaPerdida = true;
+      return { ...sel, estadoSel: ganhouSel ? "ganha" : "perdida", golsCasa: jogo.golsCasa, golsFora: jogo.golsFora };
     });
-    if (ganhou) {
-      const jog = allJogadores[aposta.uid];
-      if (jog) await updateDoc(doc(db, "jogadores", aposta.uid), {
-        saldo: +(jog.saldo + aposta.valor * aposta.odd).toFixed(2)
-      });
+
+    const updates = { apostas: apostasAtualizadas };
+
+    // Se todas as seleções estão resolvidas, fecha a aposta múltipla
+    if (todasResolvidas) {
+      const ganhouTudo = !algumaPerdida;
+      const lucro = ganhouTudo
+        ? +(aposta.valor * aposta.odd - aposta.valor).toFixed(2)
+        : +(-aposta.valor).toFixed(2);
+      updates.estado      = ganhouTudo ? "ganha" : "perdida";
+      updates.lucro       = lucro;
+      updates.resolvidaEm = serverTimestamp();
+      if (ganhouTudo) {
+        const jog = allJogadores[aposta.uid];
+        if (jog) await updateDoc(doc(db, "jogadores", aposta.uid), {
+          saldo: +(jog.saldo + aposta.valor * aposta.odd).toFixed(2)
+        });
+      }
     }
+
+    await updateDoc(doc(db, "apostas", aposta.id), updates);
   }
 }
 
@@ -170,37 +200,76 @@ function iniciarListeners() {
   unsubJog = onSnapshot(collection(db, "jogadores"), snap => {
     allJogadores = {};
     snap.forEach(d => { allJogadores[d.id] = d.data(); });
-    renderizarTudo();
+    // Pequeno delay para garantir que allApostas também está atualizado
+    setTimeout(() => renderizarTudo(), 100);
   });
 
   unsubAp = onSnapshot(collection(db, "apostas"), snap => {
+    const anterior = { ...allApostas };
     allApostas = {};
     snap.forEach(d => { allApostas[d.id] = d.data(); });
+
+    // Deteta mudanças para notificações e feed
+    snap.docChanges().forEach(change => {
+      const aposta = change.doc.data();
+      const ant    = anterior[change.doc.id];
+      if (change.type === "modified" && ant) {
+        // Aposta resolvida agora
+        if (ant.estado === "pendente" && aposta.estado !== "pendente") {
+          const jog = allJogadores[aposta.uid];
+          const ganhou = aposta.estado === "ganha";
+          mostrarNotificacao(
+            ganhou ? "🎉 Aposta ganha!" : "❌ Aposta perdida",
+            `${jog?.nome || "?"} — ${aposta.jogo}${ganhou ? " +" + aposta.lucro?.toFixed(2) + " €" : ""}`,
+            ganhou ? "ganha" : "perdida"
+          );
+          adicionarFeed(aposta, "resolvida");
+          // Flash row na leaderboard
+          setTimeout(() => {
+            const rows = document.querySelectorAll(".lb-row");
+            rows.forEach(row => {
+              const nomeEl = row.querySelector(".lb-nome");
+              if (nomeEl && nomeEl.textContent.includes(jog?.nome || "")) {
+                row.classList.add(ganhou ? "flash-g" : "flash-r");
+                setTimeout(() => row.classList.remove("flash-g","flash-r"), 1000);
+              }
+            });
+          }, 300);
+        }
+        // Nova aposta criada
+      } else if (change.type === "added" && !ant && aposta.criadaEm) {
+        adicionarFeed(aposta, "nova");
+      }
+    });
+
     renderizarTudo();
     if (tabAtual === "grafico") renderGrafico();
+    if (tabAtual === "leaderboard") renderFeed();
   });
 }
 
 // ─── TABS ─────────────────────────────────────────────────────────────────
 window.mostrarTab = function(tab) {
   tabAtual = tab;
-  ["leaderboard","meu-perfil","todos","grafico"].forEach(t => {
+  ["leaderboard","meu-perfil","todos","anteriores","grafico"].forEach(t => {
     const tabEl = $(`tab-${t}`);
     const secEl = $(`section-${t}`);
     if (tabEl) tabEl.classList.toggle("active", t === tab);
     if (secEl) secEl.style.display = t === tab ? "block" : "none";
   });
   renderizarTudo();
-  if (tab === "grafico") renderGrafico();
+  if (tab === "grafico")    renderGrafico();
+  if (tab === "anteriores") renderAnteriores();
 };
 
 // ─── RENDER PRINCIPAL ─────────────────────────────────────────────────────
 function renderizarTudo() {
   if (!currentUser) return;
   atualizarNavbar();
-  if (tabAtual === "leaderboard") renderLeaderboard();
-  else if (tabAtual === "meu-perfil") renderMeuPerfil();
-  else if (tabAtual === "todos") renderTodos();
+  if (tabAtual === "leaderboard")  renderLeaderboard();
+  else if (tabAtual === "meu-perfil")  renderMeuPerfil();
+  else if (tabAtual === "todos")       renderTodos();
+  else if (tabAtual === "anteriores")  renderAnteriores();
 }
 
 function atualizarNavbar() {
@@ -212,6 +281,266 @@ function atualizarNavbar() {
   }
 }
 
+// ─── NOTIFICAÇÕES NO SITE ─────────────────────────────────────────────────
+const notificacoes = [];
+
+function mostrarNotificacao(titulo, corpo, tipo = "info") {
+  // Guarda na lista
+  notificacoes.unshift({ titulo, corpo, tipo, ts: Date.now(), lida: false });
+  if (notificacoes.length > 30) notificacoes.pop();
+  atualizarBadge();
+  renderNotifPanel();
+
+  // Toast popup temporário
+  const n = document.createElement("div");
+  const cor = tipo === "ganha" ? "#1D9E75" : tipo === "perdida" ? "#7f1d1d" : "#16261f";
+  const borda = tipo === "ganha" ? "var(--grn)" : tipo === "perdida" ? "var(--red)" : "rgba(255,255,255,0.2)";
+  n.style.cssText = `position:fixed;top:56px;right:16px;z-index:998;background:var(--bg2);border:1px solid ${borda};border-radius:var(--rad);padding:12px 16px;max-width:280px;box-shadow:0 8px 24px rgba(0,0,0,.5);animation:slideInRight .3s ease;cursor:pointer;`;
+  n.innerHTML = `<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:3px">${titulo}</div><div style="font-size:12px;color:rgba(255,255,255,0.6)">${corpo}</div>`;
+  n.onclick = () => n.remove();
+  document.body.appendChild(n);
+  setTimeout(() => { n.style.opacity="0"; n.style.transition="opacity .5s"; setTimeout(()=>n.remove(), 500); }, 5000);
+}
+
+function atualizarBadge() {
+  const badge = $("notif-badge");
+  if (!badge) return;
+  const naoLidas = notificacoes.filter(n => !n.lida).length;
+  if (naoLidas > 0) {
+    badge.style.display = "flex";
+    badge.textContent = naoLidas > 9 ? "9+" : naoLidas;
+  } else {
+    badge.style.display = "none";
+  }
+}
+
+function renderNotifPanel() {
+  const lista = $("notif-lista");
+  if (!lista) return;
+  if (!notificacoes.length) {
+    lista.innerHTML = "<p style='font-size:13px;color:rgba(255,255,255,0.3);text-align:center;padding:1.5rem'>Sem notificações.</p>";
+    return;
+  }
+  lista.innerHTML = notificacoes.map(n => {
+    const ic  = n.tipo === "ganha" ? "✅" : n.tipo === "perdida" ? "❌" : "🔔";
+    const ago = tempoPassado(n.ts);
+    return `<div style="padding:10px 16px;border-bottom:1px solid rgba(255,255,255,0.05);${n.lida?"opacity:.5":""}">
+      <div style="font-size:13px;font-weight:600;color:#fff">${ic} ${n.titulo}</div>
+      <div style="font-size:12px;color:rgba(255,255,255,0.4);margin-top:2px">${n.corpo}</div>
+      <div style="font-size:11px;color:rgba(255,255,255,0.25);margin-top:3px">${ago}</div>
+    </div>`;
+  }).join("");
+}
+
+window.toggleNotifPanel = function() {
+  const panel = $("notif-panel");
+  if (!panel) return;
+  const aberto = panel.style.display !== "none";
+  panel.style.display = aberto ? "none" : "block";
+  if (!aberto) {
+    // Marca todas como lidas
+    notificacoes.forEach(n => n.lida = true);
+    atualizarBadge();
+    renderNotifPanel();
+  }
+};
+
+window.limparNotificacoes = function() {
+  notificacoes.length = 0;
+  atualizarBadge();
+  renderNotifPanel();
+};
+
+// Fecha painel ao clicar fora
+document.addEventListener("click", e => {
+  const panel = $("notif-panel");
+  const btn   = $("btn-notif");
+  if (panel && btn && !panel.contains(e.target) && !btn.contains(e.target)) {
+    panel.style.display = "none";
+  }
+});
+
+// ─── FEED DE ATIVIDADE ────────────────────────────────────────────────────
+function adicionarFeed(aposta, tipo) {
+  // Já não precisa de fazer nada — renderFeed lê diretamente das apostas
+  if (tabAtual === "leaderboard") renderFeed();
+}
+
+function renderFeed() {
+  const el = $("feed-atividade");
+  if (!el) return;
+
+  // Usa as apostas reais ordenadas por data (novas + recém resolvidas)
+  const todas = Object.values(allApostas)
+    .filter(a => a.criadaEm)
+    .sort((a, b) => {
+      const tsA = a.resolvidaEm?.seconds || a.criadaEm?.seconds || 0;
+      const tsB = b.resolvidaEm?.seconds || b.criadaEm?.seconds || 0;
+      return tsB - tsA;
+    })
+    .slice(0, 15);
+
+  if (!todas.length) {
+    el.innerHTML = "<p class='empty' style='padding:1rem'>Sem atividade recente.</p>";
+    return;
+  }
+
+  el.innerHTML = todas.map(a => {
+    const jog  = allJogadores[a.uid];
+    if (!jog) return "";
+
+    // Usa resolvidaEm se resolvida, senão criadaEm
+    const tsRaw = a.estado !== "pendente" && a.resolvidaEm?.seconds
+      ? a.resolvidaEm.seconds * 1000
+      : a.criadaEm?.seconds
+      ? a.criadaEm.seconds * 1000
+      : Date.now();
+
+    const ago = tempoPassado(tsRaw);
+
+    let ic, desc;
+    if (a.estado === "pendente") {
+      ic   = "📋";
+      desc = `apostou <span class="fd">${a.valor?.toFixed(2)} €</span> em ${a.jogo}`;
+    } else if (a.estado === "ganha") {
+      ic   = "✅";
+      desc = `ganhou <span class="fg">+${a.lucro?.toFixed(2)} €</span> em ${a.jogo}`;
+    } else {
+      ic   = "❌";
+      desc = `perdeu <span class="fr">${a.valor?.toFixed(2)} €</span> em ${a.jogo}`;
+    }
+
+    return `<div class="feed-row">
+      <div class="feed-av">${jog.avatar}</div>
+      <div class="feed-txt">${ic} <b>${jog.nome}</b> ${desc}</div>
+      <div class="feed-time">${ago}</div>
+    </div>`;
+  }).filter(Boolean).join("");
+}
+
+function tempoPassado(ts) {
+  const data = new Date(ts);
+  const hora = data.toLocaleTimeString("pt-PT", { hour: "2-digit", minute: "2-digit" });
+  const diff = Math.floor((Date.now() - ts) / 1000);
+  if (diff < 60)   return `agora · ${hora}`;
+  if (diff < 3600) return `há ${Math.floor(diff/60)} min · ${hora}`;
+  if (diff < 86400) return `há ${Math.floor(diff/3600)} h · ${hora}`;
+  const dia = data.toLocaleDateString("pt-PT", { day: "2-digit", month: "short" });
+  return `${dia} · ${hora}`;
+}
+
+
+
+function renderAnteriores() {
+  const lista = $("anteriores-lista");
+  if (!lista) return;
+
+  const apostas = Object.values(allApostas).filter(a => a.estado !== "pendente");
+  if (!apostas.length) {
+    lista.innerHTML = "<p class='empty'>Ainda não há apostas resolvidas.</p>";
+    return;
+  }
+
+  const porJogador = {};
+  apostas.forEach(a => {
+    if (!porJogador[a.uid]) porJogador[a.uid] = [];
+    porJogador[a.uid].push(a);
+  });
+
+  const jogadoresOrdenados = Object.values(allJogadores).sort((a,b) => b.saldo - a.saldo);
+
+  lista.innerHTML = jogadoresOrdenados.map(jog => {
+    const bets = (porJogador[jog.uid] || []).sort((a,b) => (b.criadaEm?.seconds||0) - (a.criadaEm?.seconds||0));
+    if (!bets.length) return "";
+
+    const ganhas  = bets.filter(b => b.estado === "ganha").length;
+    const perdidas = bets.filter(b => b.estado === "perdida").length;
+    const lucroTotal = bets.reduce((acc, b) => acc + (b.lucro || 0), 0);
+
+    // Separar ganhas e perdidas
+    const betsGanhas  = bets.filter(b => b.estado === "ganha");
+    const betsPerdidas = bets.filter(b => b.estado === "perdida");
+
+    const renderBet = (a) => {
+      const temDetalhe = a.apostas && a.apostas.length > 0;
+      const idDetalhe  = "ant_" + a.id;
+      const lucro = a.lucro || 0;
+      return `<div class="aposta-row" style="flex-direction:column;align-items:stretch;gap:0">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div class="aposta-jogo" style="flex:1">
+            <span class="aposta-times">${a.jogo}</span>
+            <span class="aposta-prev">${a.previsao.length>60?a.previsao.slice(0,60)+"…":a.previsao} · odd ${a.odd?.toFixed?a.odd.toFixed(2):a.odd}</span>
+          </div>
+          <div class="aposta-dir">
+            <span class="aposta-val">${fmtAbs(a.valor)}</span>
+            <span class="chip chip-${a.estado}">${labelEstado(a.estado, a.lucro)}</span>
+          </div>
+          ${temDetalhe ? `<button onclick="window.toggleDetalhe('${idDetalhe}')" id="btn_${idDetalhe}" style="background:none;border:none;cursor:pointer;color:var(--t3);font-size:16px;padding:4px;transition:transform .2s;flex-shrink:0">▼</button>` : ""}
+        </div>
+        ${temDetalhe ? `<div id="${idDetalhe}" style="display:none;margin:0 16px 8px;padding:10px 12px;background:var(--bg3);border-radius:var(--rad-xs);border:1px solid var(--line)">
+          ${a.apostas.map(s => {
+            const st  = s.estadoSel || (a.estado === "ganha" ? "ganha" : "perdida");
+            const cor = st === "ganha" ? "var(--grn)" : "var(--red)";
+            const ic  = st === "ganha" ? "✅" : "❌";
+            return `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line2)">
+              <div>
+                <div style="font-size:12px;font-weight:500;color:${cor}">${ic} ${s.jogo}</div>
+                <div style="font-size:11px;color:var(--t4);margin-top:1px">${s.previsao}</div>
+              </div>
+              <div style="font-size:11px;color:var(--t4);flex-shrink:0;margin-left:12px">×${s.odd}</div>
+            </div>`;
+          }).join("")}
+          <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:12px">
+            <span style="color:var(--t4)">Apostado</span><strong>${fmtAbs(a.valor)}</strong>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:12px">
+            <span style="color:var(--t4)">Resultado</span>
+            <strong style="color:${lucro>=0?"var(--grn)":"var(--red)"}">${lucro>=0?"+":""}${lucro.toFixed(2)} €</strong>
+          </div>
+        </div>` : ""}
+      </div>`;
+    };
+
+    return `<div style="margin-bottom:0">
+      <!-- Header do jogador -->
+      <div style="display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--bg2)">
+        <div class="av-mini" style="width:28px;height:28px;font-size:11px;flex-shrink:0">${jog.avatar}</div>
+        <div style="flex:1">
+          <div style="font-size:13px;font-weight:500;color:var(--t1)">${jog.nome}</div>
+          <div style="font-size:11px;color:var(--t4);margin-top:1px">${ganhas} ganhas · ${perdidas} perdidas · <span style="color:${lucroTotal>=0?"var(--grn)":"var(--red)"};font-weight:500">${lucroTotal>=0?"+":""}${lucroTotal.toFixed(2)} €</span></div>
+        </div>
+      </div>
+
+      ${betsGanhas.length ? `
+      <!-- Ganhas -->
+      <div style="padding:6px 16px 4px;border-bottom:1px solid var(--line2);background:rgba(48,209,88,.04)">
+        <span style="font-size:9px;font-weight:600;color:var(--grn);text-transform:uppercase;letter-spacing:.06em">✅ Ganhas (${betsGanhas.length})</span>
+      </div>
+      ${betsGanhas.map(renderBet).join("")}` : ""}
+
+      ${betsPerdidas.length ? `
+      <!-- Perdidas -->
+      <div style="padding:6px 16px 4px;border-bottom:1px solid var(--line2);background:rgba(255,69,58,.04)">
+        <span style="font-size:9px;font-weight:600;color:var(--red);text-transform:uppercase;letter-spacing:.06em">❌ Perdidas (${betsPerdidas.length})</span>
+      </div>
+      ${betsPerdidas.map(renderBet).join("")}` : ""}
+    </div>`;
+  }).filter(Boolean).join("");
+}
+
+// ─── INIT ─────────────────────────────────────────────────────────────────
+// Auth state handles initialization
+// ─── SUBTABS LEADERBOARD ──────────────────────────────────────────────────
+window.mostrarSubtab = function(sub) {
+  ["ranking","historico"].forEach(s => {
+    const btn  = $(`subtab-${s}`);
+    const view = $(`subview-${s}`);
+    if (btn)  btn.classList.toggle("active", s === sub);
+    if (view) view.style.display = s === sub ? "block" : "none";
+  });
+  if (sub === "historico") renderHistorico();
+};
+
 function renderLeaderboard() {
   const sorted = Object.values(allJogadores).sort((a, b) => b.saldo - a.saldo);
   const apostas = Object.values(allApostas);
@@ -220,33 +549,54 @@ function renderLeaderboard() {
   $("stat-pendentes").textContent = apostas.filter(a => a.estado === "pendente").length;
   $("stat-jogadores").textContent = sorted.length;
   const melhor = apostas.filter(a => a.lucro !== undefined).sort((a,b) => b.lucro - a.lucro)[0];
-  $("stat-melhor").textContent = melhor ? fmt(melhor.lucro) : "—";
+  const melhorEl = $("stat-melhor");
+  if (melhorEl) { melhorEl.textContent = melhor ? fmt(melhor.lucro) : "—"; melhorEl.className = "stat-val" + (melhor && melhor.lucro > 0 ? " pos" : ""); }
 
   if (!sorted.length) {
     $("leaderboard-lista").innerHTML = "<p class='empty'>Ainda não há jogadores registados.</p>";
     return;
   }
+  const maxSaldo = sorted.length ? sorted[0].saldo : 10;
+  const prevPos  = window._prevPositions || {};
+  const newPos   = {};
+  sorted.forEach((j, i) => { newPos[j.uid] = i; });
+
+  renderFeed();
   $("leaderboard-lista").innerHTML = sorted.map((j, i) => {
-    const diff  = +(j.saldo - SALDO_INICIAL).toFixed(2);
-    const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i+1}`;
-    const isMe  = currentUser && j.uid === currentUser.uid;
-    const minhas = apostas.filter(a => a.uid === j.uid);
-    const ganhas = minhas.filter(a => a.estado === "ganha").length;
-    const total  = minhas.filter(a => a.estado !== "pendente").length;
-    const taxa   = total ? Math.round(ganhas/total*100) : 0;
+    const diff     = +(j.saldo - SALDO_INICIAL).toFixed(2);
+    const medal    = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i+1}`;
+    const isMe     = currentUser && j.uid === currentUser.uid;
+    const minhas   = apostas.filter(a => a.uid === j.uid);
+    const ganhas   = minhas.filter(a => a.estado === "ganha").length;
+    const total    = minhas.filter(a => a.estado !== "pendente").length;
+    const taxa     = total ? Math.round(ganhas/total*100) : 0;
+    const pct      = maxSaldo > 0 ? Math.round((j.saldo / maxSaldo) * 100) : 0;
+    const temLive  = minhas.some(a =>
+      a.estado === "pendente" && a.apostas?.some(s =>
+        s.status === "IN_PLAY" || s.status === "PAUSED"
+      )
+    );
+    const oldPos   = prevPos[j.uid];
+    const posChange = oldPos !== undefined ? oldPos - i : 0;
+    const arrowHTML = posChange > 0 ? `<span class="arrow-up">↑${posChange}</span>`
+                    : posChange < 0 ? `<span class="arrow-dn">↓${Math.abs(posChange)}</span>` : "";
+    const liveHTML  = temLive ? `<span class="live-chip"><span class="live-dot"></span>LIVE</span>` : "";
     return `<div class="lb-row ${isMe ? "lb-me" : ""}">
+      <div class="lb-bar" style="width:${pct}%"></div>
       <div class="lb-rank">${medal}</div>
       <div class="lb-avatar">${j.avatar}</div>
       <div class="lb-info">
-        <div class="lb-nome">${j.nome}${isMe ? ' <span class="tag-eu">tu</span>' : ""}</div>
+        <div class="lb-nome ${i===0?"gold":i>3?"dim":""}">${j.nome}${isMe ? ' <span class="tag-eu">tu</span>' : ""} ${arrowHTML} ${liveHTML}</div>
         <div class="lb-meta">${ganhas}/${total} apostas · ${taxa}% acerto</div>
       </div>
       <div class="lb-saldo">
-        <div class="lb-val">${fmtAbs(j.saldo)}</div>
+        <div class="lb-val ${i>4?"dim":""}">${fmtAbs(j.saldo)}</div>
         <div class="lb-diff ${diff >= 0 ? "pos" : "neg"}">${fmt(diff)}</div>
       </div>
     </div>`;
   }).join("");
+
+  window._prevPositions = newPos;
 }
 
 function isAdmin() { return currentUser?.uid === ADMIN_UID; }
@@ -261,7 +611,7 @@ function renderMeuPerfil() {
   $("perfil-nome").textContent   = jog.nome;
   $("perfil-saldo").textContent  = fmtAbs(jog.saldo);
   $("perfil-diff").textContent   = fmt(diff);
-  $("perfil-diff").className     = "lb-diff " + (diff >= 0 ? "pos" : "neg");
+  $("perfil-diff").className     = "perfil-diff " + (diff >= 0 ? "pos" : "neg");
 
   const minhas = Object.values(allApostas)
     .filter(a => a.uid === currentUser.uid)
@@ -284,9 +634,70 @@ function renderMeuPerfil() {
       <div class="aposta-dir">
         <span class="aposta-val">${fmtAbs(a.valor)}</span>
         <span class="chip chip-${a.estado}">${labelEstado(a.estado, a.lucro)}</span>
-        <button onclick="removerAposta('${a.id}')" style="background:none;border:none;cursor:pointer;font-size:16px;color:#534AB7;padding:2px 4px;border-radius:4px;transition:color .2s" title="Remover aposta" onmouseover="this.style.color='#f87171'" onmouseout="this.style.color='#534AB7'">🗑</button>
+        <button onclick="removerAposta('${a.id}')" style="background:none;border:none;cursor:pointer;font-size:16px;color:var(--acc);padding:2px 4px;border-radius:4px;transition:color .2s" title="Remover aposta" onmouseover="this.style.color='#f87171'" onmouseout="this.style.color='var(--acc)'">🗑</button>
       </div>
     </div>`).join("") : "<p class='empty'>Ainda não fizeste nenhuma aposta.</p>";
+
+  // Histórico de saldo
+  renderHistoricoSaldo(minhas);
+}
+
+function renderHistoricoSaldo(apostas) {
+  const el = $("perfil-historico-saldo");
+  if (!el || !window.Chart) return;
+
+  const resolvidas = apostas
+    .filter(a => a.estado !== "pendente" && a.criadaEm && a.lucro !== undefined)
+    .sort((a,b) => (a.criadaEm?.seconds||0) - (b.criadaEm?.seconds||0));
+
+  if (!resolvidas.length) {
+    el.innerHTML = "<p style='font-size:13px;color:rgba(255,255,255,0.25);text-align:center;padding:1rem'>Sem apostas resolvidas ainda.</p>";
+    return;
+  }
+
+  // Calcula saldo acumulado
+  let saldo = 10;
+  const labels = ["Início"];
+  const dados  = [10];
+  resolvidas.forEach(a => {
+    saldo = +(saldo + (a.estado === "ganha" ? a.valor * a.odd : 0)).toFixed(2);
+    const ts = a.criadaEm?.seconds ? new Date(a.criadaEm.seconds*1000) : new Date();
+    labels.push(ts.toLocaleDateString("pt-PT", {day:"2-digit",month:"short"}));
+    dados.push(saldo);
+  });
+
+  el.innerHTML = '<canvas id="canvas-saldo" style="max-height:200px"></canvas>';
+
+  if (window._saldoChart) { window._saldoChart.destroy(); }
+  const ctx = $("canvas-saldo").getContext("2d");
+  window._saldoChart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        data: dados,
+        borderColor: "#D4A017",
+        backgroundColor: "rgba(212,160,23,0.08)",
+        borderWidth: 2,
+        pointBackgroundColor: "#D4A017",
+        pointRadius: 4,
+        tension: 0.3,
+        fill: true
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false }, tooltip: {
+        backgroundColor: "#16261f", borderColor: "#1D9E75", borderWidth: 1,
+        titleColor: "rgba(255,255,255,0.5)", bodyColor: "#fff",
+        callbacks: { label: c => ` ${c.parsed.y.toFixed(2)} €` }
+      }},
+      scales: {
+        x: { grid: { color: "rgba(255,255,255,0.07)" }, ticks: { color: "rgba(255,255,255,0.45)", font: { size: 12 } } },
+        y: { grid: { color: "rgba(255,255,255,0.07)" }, ticks: { color: "rgba(255,255,255,0.45)", font: { size: 12 }, callback: v => v.toFixed(2)+" €" }, suggestedMin: 0 }
+      }
+    }
+  });
 }
 
 window.removerAposta = async function(id) {
@@ -306,65 +717,89 @@ window.removerAposta = async function(id) {
   showToast("Aposta removida e saldo atualizado.", "sucesso");
 };
 
+
 function renderTodos() {
-  const apostas = Object.values(allApostas);
+  const apostas = Object.values(allApostas).filter(a => a.estado === "pendente");
   if (!apostas.length) {
-    $("todos-lista").innerHTML = "<p class='empty'>Ainda não há apostas.</p>"; return;
+    $("todos-lista").innerHTML = "<p class='empty'>Não há apostas ativas de momento.</p>"; return;
   }
-  const grupos = {};
+
+  // Agrupa por jogador
+  const porJogador = {};
   apostas.forEach(a => {
-    if (!grupos[a.jogo]) grupos[a.jogo] = [];
-    grupos[a.jogo].push(a);
+    if (!porJogador[a.uid]) porJogador[a.uid] = [];
+    porJogador[a.uid].push(a);
   });
-  $("todos-lista").innerHTML = Object.entries(grupos).map(([jogo, bets]) => `
-    <div class="grupo-jogo">
-      <div class="grupo-titulo">${jogo}</div>
+
+  const jogadoresOrdenados = Object.values(allJogadores).sort((a,b) => b.saldo - a.saldo);
+
+  $("todos-lista").innerHTML = jogadoresOrdenados.map(jog => {
+    const bets = (porJogador[jog.uid] || []).sort((a,b) => (b.criadaEm?.seconds||0) - (a.criadaEm?.seconds||0));
+    if (!bets.length) return "";
+    const ganhas = bets.filter(b => b.estado === "ganha").length;
+    const total  = bets.filter(b => b.estado !== "pendente").length;
+    const taxa   = total ? Math.round(ganhas/total*100) : 0;
+    const diff   = +(jog.saldo - 10).toFixed(2);
+
+    return `<div style="margin-bottom:1.5rem">
+      <div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:2px solid rgba(255,255,255,.06);margin-bottom:4px">
+        <div class="av-mini" style="width:32px;height:32px;font-size:12px;flex-shrink:0">${jog.avatar}</div>
+        <div style="flex:1">
+          <div style="font-size:13px;font-weight:500;color:var(--t1)">${jog.nome}</div>
+          <div style="font-size:11px;color:rgba(255,255,255,0.3);margin-top:1px">${bets.length} apostas · ${taxa}% acerto</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:15px;font-weight:700;color:#fff">${fmtAbs(jog.saldo)}</div>
+          <div style="font-size:11px;font-weight:600;${diff>=0?"color:var(--grn)":"color:var(--red)"}">${fmt(diff)}</div>
+        </div>
+      </div>
       ${bets.map(a => {
-        const jog = Object.values(allJogadores).find(j => j.uid === a.uid);
         const temDetalhe = a.apostas && a.apostas.length > 0;
-        const idDetalhe = "det_" + a.id;
-        return `<div class="aposta-row" style="flex-direction:column;align-items:stretch;gap:0">
+        const idDetalhe  = "det_" + a.id;
+        return `<div class="aposta-row" style="flex-direction:column;align-items:stretch;gap:0;overflow:visible">
           <div style="display:flex;align-items:center;gap:10px">
-            <div class="aposta-jogo" style="display:flex;align-items:center;gap:8px;flex:1">
-              <div class="av-mini">${jog ? jog.avatar : "?"}</div>
-              <div>
-                <span class="aposta-times">${jog ? jog.nome : "?"}</span>
-                <span class="aposta-prev">${a.previsao.length > 60 ? a.previsao.slice(0,60)+"…" : a.previsao} · odd ${a.odd?.toFixed ? a.odd.toFixed(2) : a.odd}</span>
-              </div>
+            <div class="aposta-jogo" style="flex:1">
+              <span class="aposta-times">${a.jogo}</span>
+              <span class="aposta-prev">${a.previsao.length>60?a.previsao.slice(0,60)+"…":a.previsao} · odd ${a.odd?.toFixed?a.odd.toFixed(2):a.odd}</span>
             </div>
             <div class="aposta-dir">
               <span class="aposta-val">${fmtAbs(a.valor)}</span>
               <span class="chip chip-${a.estado}">${labelEstado(a.estado, a.lucro)}</span>
             </div>
-            ${temDetalhe ? `<button onclick="toggleDetalhe('${idDetalhe}')" style="background:none;border:none;cursor:pointer;color:#7F77DD;font-size:18px;padding:4px;transition:transform .2s;flex-shrink:0" id="btn_${idDetalhe}" title="Ver boletim">▼</button>` : ""}
+            ${temDetalhe ? `<button onclick="window.toggleDetalhe('${idDetalhe}')" id="btn_${idDetalhe}" style="background:none;border:none;cursor:pointer;color:var(--t3);font-size:16px;padding:4px;transition:transform .2s;flex-shrink:0">▼</button>` : ""}
           </div>
           ${temDetalhe ? `
-          <div id="${idDetalhe}" style="display:none;margin-top:10px;padding:10px 12px;background:#0e0e1a;border-radius:8px;border:1px solid #2e2b54">
-            <div style="font-size:11px;font-weight:700;color:#534AB7;letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px">Boletim · ${a.apostas.length} seleção${a.apostas.length > 1 ? "ões" : ""}</div>
-            ${a.apostas.map(s => `
-              <div style="display:flex;justify-content:space-between;align-items:flex-start;padding:7px 0;border-bottom:1px solid #2e2b54">
-                <div>
-                  <div style="font-size:13px;font-weight:600;color:#e8e7f8">${s.jogo}</div>
-                  <div style="font-size:12px;color:#7F77DD;margin-top:2px">${s.previsao}</div>
+          <div id="${idDetalhe}" style="display:none;margin:0 16px 8px;padding:10px 12px;background:var(--bg3);border-radius:var(--rad-xs);border:1px solid var(--line)">
+            <div style="font-size:10px;font-weight:700;color:rgba(255,255,255,0.3);letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px">Boletim · ${a.apostas.length} seleção${a.apostas.length>1?"ões":""}</div>
+            ${a.apostas.map(s => {
+              const st=s.estadoSel||"pendente";
+              const cor=st==="ganha"?"var(--grn)":st==="perdida"?"var(--red)":"var(--t2)";
+              const ic=st==="ganha"?"✅":st==="perdida"?"❌":"⏳";
+              const resultado = (s.golsCasa !== null && s.golsCasa !== undefined)
+                ? `${s.golsCasa} - ${s.golsFora}` : null;
+              return `<div style="display:flex;justify-content:space-between;align-items:flex-start;padding:7px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+                <div style="flex:1">
+                  <div style="font-size:12px;font-weight:500;color:${cor}">${ic} ${s.jogo}</div>
+                  <div style="font-size:11px;color:var(--t4);margin-top:1px">${s.previsao}</div>
+                  ${resultado ? `<div style="font-size:11px;color:rgba(255,255,255,0.25);margin-top:2px">Resultado: ${resultado}</div>` : ""}
                 </div>
-                <div style="font-size:13px;font-weight:700;color:#AFA9EC;flex-shrink:0;margin-left:12px">× ${s.odd}</div>
-              </div>`).join("")}
+                <div style="font-size:11px;color:var(--t4);flex-shrink:0;margin-left:12px">× ${s.odd}</div>
+              </div>`;
+            }).join("")}
             <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:13px">
-              <span style="color:#7F77DD">Odd total</span>
-              <strong style="color:#e8e7f8">${a.odd?.toFixed ? a.odd.toFixed(2) : a.odd}</strong>
+              <span style="color:rgba(255,255,255,0.3)">Odd total</span><strong style="color:#fff">${a.odd?.toFixed?a.odd.toFixed(2):a.odd}</strong>
             </div>
             <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:13px">
-              <span style="color:#7F77DD">Apostado</span>
-              <strong style="color:#e8e7f8">${fmtAbs(a.valor)}</strong>
+              <span style="color:rgba(255,255,255,0.3)">Apostado</span><strong style="color:#fff">${fmtAbs(a.valor)}</strong>
             </div>
-            ${a.valor && a.odd ? `<div style="display:flex;justify-content:space-between;margin-top:4px;font-size:13px">
-              <span style="color:#7F77DD">Ganhos potenciais</span>
-              <strong style="color:#7F77DD">${(a.valor * a.odd).toFixed(2)} €</strong>
-            </div>` : ""}
+            ${a.valor&&a.odd?`<div style="display:flex;justify-content:space-between;margin-top:4px;font-size:13px">
+              <span style="color:rgba(255,255,255,0.3)">Ganhos potenciais</span><strong style="color:var(--grn)">${(a.valor*a.odd).toFixed(2)} €</strong>
+            </div>`:""}
           </div>` : ""}
         </div>`;
       }).join("")}
-    </div>`).join("");
+    </div>`;
+  }).filter(Boolean).join("");
 }
 
 window.toggleDetalhe = function(id) {
@@ -513,7 +948,7 @@ window.mostrarPreviewGemini = function(apostas) {
           value="${valor ? valor.toFixed(2) : ""}"
           oninput="atualizarGanhosPrevistos()">
       </div>
-      <div style="width:100%;background:var(--verde-l);border-radius:var(--rad-sm);padding:10px 14px;font-size:14px;color:var(--verde2)">
+      <div style="width:100%;background:rgba(48,209,88,.1);border-radius:var(--rad-xs);padding:10px 14px;font-size:14px;color:var(--grn)">
         💰 Ganhos potenciais: <strong id="gemini-ganhos-prev">${ganhos ? ganhos.toFixed(2) + " €" : "—"}</strong>
         <span style="font-size:12px;color:var(--cinza3);margin-left:6px" id="gemini-odd-total"></span>
       </div>
@@ -565,6 +1000,7 @@ window.confirmarApostasGemini = async function() {
   await updateDoc(doc(db, "jogadores", currentUser.uid), {
     saldo: +(jog.saldo - valor).toFixed(2)
   });
+  await registarLog(`Nova aposta: ${currentUser.uid} — ${jogoNome} · ${valor?.toFixed(2)} €`);
   fecharModalImagem();
   showToast("Aposta registada!", "sucesso");
 }
@@ -575,13 +1011,13 @@ function renderTesteApostas() {
   const lista = $("teste-apostas-lista");
   if (!lista) return;
   if (!pendentes.length) {
-    lista.innerHTML = "<p style='font-size:13px;color:#534AB7;text-align:center;padding:.5rem'>Não tens apostas pendentes.</p>";
+    lista.innerHTML = "<p style='font-size:13px;color:var(--acc);text-align:center;padding:.5rem'>Não tens apostas pendentes.</p>";
     return;
   }
   lista.innerHTML = pendentes.map(a => `
-    <div style="background:#16162a;border:1px solid #2e2b54;border-radius:8px;padding:10px 12px;margin-bottom:8px">
+    <div style="background:#16162a;border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:8px">
       <div style="font-size:13px;font-weight:600;color:#e8e7f8;margin-bottom:4px">${a.jogo}</div>
-      <div style="font-size:12px;color:#7F77DD;margin-bottom:8px">${a.previsao.slice(0,80)}${a.previsao.length>80?"…":""} · odd ${a.odd?.toFixed?a.odd.toFixed(2):a.odd}</div>
+      <div style="font-size:12px;color:var(--acc);margin-bottom:8px">${a.previsao.slice(0,80)}${a.previsao.length>80?"…":""} · odd ${a.odd?.toFixed?a.odd.toFixed(2):a.odd}</div>
       <div style="display:flex;gap:6px">
         <button onclick="resolverAposta('${a.id}', true)"
           style="flex:1;background:#065f46;color:#fff;border:none;border-radius:6px;padding:7px;font-size:12px;font-weight:600;cursor:pointer">
@@ -670,7 +1106,7 @@ function renderGrafico() {
     if (canvas) {
       const ctx = canvas.getContext("2d");
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = "#534AB7";
+      ctx.fillStyle = "var(--acc)";
       ctx.font = "14px sans-serif";
       ctx.textAlign = "center";
       ctx.fillText("Ainda não há apostas resolvidas para mostrar.", canvas.width / 2, 80);
@@ -688,12 +1124,16 @@ function renderGrafico() {
 
   // Paleta de cores para cada jogador
   const cores = [
-    { line: "#7F77DD", fill: "rgba(127,119,221,0.15)" },
-    { line: "#1D9E75", fill: "rgba(29,158,117,0.15)" },
-    { line: "#D85A30", fill: "rgba(216,90,48,0.15)"  },
-    { line: "#c9a84c", fill: "rgba(201,168,76,0.15)" },
-    { line: "#AFA9EC", fill: "rgba(175,169,236,0.15)"},
-    { line: "#5DCAA5", fill: "rgba(93,202,165,0.15)" },
+    { line: "#30d158", fill: "rgba(48,209,88,0.12)"   },  // verde
+    { line: "#6b9bd2", fill: "rgba(107,155,210,0.12)" },  // azul
+    { line: "#ff9f0a", fill: "rgba(255,159,10,0.12)"  },  // laranja
+    { line: "#bf5af2", fill: "rgba(191,90,242,0.12)"  },  // roxo
+    { line: "#ff453a", fill: "rgba(255,69,58,0.12)"   },  // vermelho
+    { line: "#ffd60a", fill: "rgba(255,214,10,0.12)"  },  // amarelo
+    { line: "#5ac8fa", fill: "rgba(90,200,250,0.12)"  },  // azul claro
+    { line: "#ff6b6b", fill: "rgba(255,107,107,0.12)" },  // coral
+    { line: "#4ecdc4", fill: "rgba(78,205,196,0.12)"  },  // teal
+    { line: "#a8e6cf", fill: "rgba(168,230,207,0.12)" },  // verde claro
   ];
 
   // Para cada jogador, calcula o saldo acumulado por dia
@@ -709,10 +1149,19 @@ function renderGrafico() {
       apostasNoDia.forEach(a => { saldo = +(saldo + a.lucro).toFixed(2); });
       return saldo;
     });
-    // Prepend ponto inicial (antes do primeiro dia)
+    // Adiciona o saldo real atual como último ponto se for diferente
+    const ultimoPonto = pontos.length ? pontos[pontos.length - 1] : 10;
+    const saldoReal   = jog.saldo;
+    const dadosFinais = saldoReal !== ultimoPonto ? [...pontos, saldoReal] : pontos;
+    const labelsExtra = saldoReal !== ultimoPonto ? [...dias, "Agora"] : dias;
+    window._grafLabels = ["Início", ...labelsExtra.map(d => {
+      if (d === "Agora") return "Agora";
+      const [y, m, dd] = d.split("-"); return `${dd}/${m}`;
+    })];
+
     return {
       label: jog.nome,
-      data: [10, ...pontos],
+      data: [10, ...dadosFinais],
       borderColor: cor.line,
       backgroundColor: cor.fill,
       borderWidth: 2.5,
@@ -724,7 +1173,7 @@ function renderGrafico() {
     };
   });
 
-  const labels = ["Início", ...dias.map(d => {
+  const labels = window._grafLabels || ["Início", ...dias.map(d => {
     const [y, m, dd] = d.split("-");
     return `${dd}/${m}`;
   })];
@@ -732,7 +1181,7 @@ function renderGrafico() {
   // Legenda custom
   $("grafico-legenda").innerHTML = jogadores.map((jog, i) => {
     const cor = cores[i % cores.length];
-    return `<div style="display:flex;align-items:center;gap:6px;font-size:12px;color:#AFA9EC">
+    return `<div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--t2)">
       <div style="width:12px;height:12px;border-radius:50%;background:${cor.line};flex-shrink:0"></div>
       ${jog.nome}
     </div>`;
@@ -741,10 +1190,23 @@ function renderGrafico() {
   // Destrói chart anterior se existir
   if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
 
+  // Plugin para fundo do chart
+  const bgPlugin = {
+    id: "customBg",
+    beforeDraw(chart) {
+      const ctx = chart.ctx;
+      ctx.save();
+      ctx.fillStyle = "#1c1c1e";
+      ctx.fillRect(0, 0, chart.width, chart.height);
+      ctx.restore();
+    }
+  };
+
   const ctx = $("grafico-canvas").getContext("2d");
   chartInstance = new Chart(ctx, {
     type: "line",
     data: { labels, datasets },
+    plugins: [bgPlugin],
     options: {
       responsive: true,
       maintainAspectRatio: true,
@@ -753,11 +1215,12 @@ function renderGrafico() {
       plugins: {
         legend: { display: false },
         tooltip: {
-          backgroundColor: "#16162a",
-          borderColor: "#534AB7",
+          backgroundColor: "#2c2c2e",
+          borderColor: "rgba(255,255,255,0.15)",
           borderWidth: 1,
-          titleColor: "#AFA9EC",
-          bodyColor: "#e8e7f8",
+          titleColor: "rgba(255,255,255,0.5)",
+          bodyColor: "#ffffff",
+          padding: 10,
           callbacks: {
             label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y.toFixed(2)} €`
           }
@@ -765,16 +1228,18 @@ function renderGrafico() {
       },
       scales: {
         x: {
-          grid: { color: "#2e2b54" },
-          ticks: { color: "#7F77DD", font: { size: 12 } }
+          grid: { color: "rgba(255,255,255,0.08)" },
+          ticks: { color: "rgba(255,255,255,0.5)", font: { size: 12 } },
+          border: { color: "rgba(255,255,255,0.1)" }
         },
         y: {
-          grid: { color: "#2e2b54" },
+          grid: { color: "rgba(255,255,255,0.08)" },
           ticks: {
-            color: "#7F77DD",
+            color: "rgba(255,255,255,0.5)",
             font: { size: 12 },
             callback: v => v.toFixed(2) + " €"
           },
+          border: { color: "rgba(255,255,255,0.1)" },
           suggestedMin: 0,
         }
       }
@@ -782,33 +1247,357 @@ function renderGrafico() {
   });
 }
 
+
 // ─── PAINEL ADMIN ─────────────────────────────────────────────────────────
+window.adminTab = function(tab) {
+  ["apostas","corrigir","bloquear","saldos","historico-admin","log"].forEach(t => {
+    const btn  = $(`admin-tab-${t}`);
+    const view = $(`admin-view-${t}`);
+    if (btn)  btn.classList.toggle("active", t === tab);
+    if (view) view.style.display = t === tab ? "block" : "none";
+  });
+  if (tab === "corrigir")  renderAdminCorrigir();
+  if (tab === "bloquear")       renderAdminBloquear();
+  if (tab === "saldos")    renderAdminSaldos();
+  if (tab === "historico-admin") renderAdminHistorico();
+  if (tab === "log")       renderAdminLog();
+};
+
+// ── Corrigir apostas resolvidas ────────────────────────────────────────────
+function renderAdminCorrigir() {
+  const lista = $("admin-view-corrigir");
+  if (!lista) return;
+
+  const resolvidas = Object.values(allApostas)
+    .filter(a => a.estado !== "pendente")
+    .sort((a,b) => (b.resolvidaEm?.seconds||b.criadaEm?.seconds||0) - (a.resolvidaEm?.seconds||a.criadaEm?.seconds||0));
+
+  if (!resolvidas.length) {
+    lista.innerHTML = "<p class='empty'>Sem apostas resolvidas.</p>";
+    return;
+  }
+
+  lista.innerHTML = resolvidas.map(a => {
+    const jog    = allJogadores[a.uid];
+    const ganhou = a.estado === "ganha";
+    const stClass = ganhou ? "won" : "lost";
+    const stIcon  = ganhou ? "ti-check" : "ti-x";
+    const tipo    = a.apostas?.length > 1 ? `Múltipla ${a.apostas.length}×` : "Simples";
+
+    return `<div class="adm-bet-card">
+      <div class="adm-bet-head">
+        <div class="adm-bet-av">${jog?.avatar||"?"}</div>
+        <div class="adm-bet-player">${jog?.nome||"?"}</div>
+        <span class="adm-bet-type">${tipo}</span>
+        <div class="adm-sel-ic ${stClass}" style="margin-left:auto;width:20px;height:20px">
+          <i class="ti ${stIcon}" style="font-size:10px" aria-hidden="true"></i>
+        </div>
+        <span style="font-size:11px;color:${ganhou?"var(--grn)":"var(--red)"};">${a.estado}</span>
+      </div>
+      <div class="adm-bet-body">
+        <div class="adm-sel-game" style="font-size:13px;margin-bottom:2px">${a.jogo}</div>
+        <div class="adm-sel-pred" style="margin-bottom:10px">${a.previsao.slice(0,70)}${a.previsao.length>70?"…":""} · odd ${a.odd?.toFixed?a.odd.toFixed(2):a.odd} · ${a.valor?.toFixed(2)} €</div>
+        <div class="adm-bet-actions">
+          <button onclick="window.corrigirAposta(this.dataset.id, true)"  data-id="${a.id}" class="adm-btn-win">Marcar como ganha</button>
+          <button onclick="window.corrigirAposta(this.dataset.id, false)" data-id="${a.id}" class="adm-btn-lose">Marcar como perdida</button>
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+window.corrigirAposta = async function(id, ganhou) {
+  if (!isAdmin()) return;
+  const aposta = allApostas[id];
+  if (!aposta) return;
+  const jog = allJogadores[aposta.uid];
+  if (!jog) return;
+
+  // Recalcula o saldo revertendo o estado anterior e aplicando o novo
+  let saldo = jog.saldo;
+
+  // Lógica:
+  // Quando a aposta foi criada, o valor foi sempre descontado do saldo.
+  // Quando foi marcada como ganha, valor*odd foi adicionado.
+  // Portanto:
+  //   - Se era GANHA e vamos corrigir para PERDIDA: remove valor*odd
+  //   - Se era PERDIDA e vamos corrigir para GANHA: adiciona valor*odd
+  //   - Se era GANHA e vamos marcar GANHA outra vez: não faz nada (já está certo)
+  //   - Se era PERDIDA e vamos marcar PERDIDA outra vez: não faz nada
+
+  const lucro = ganhou
+    ? +(aposta.valor * aposta.odd - aposta.valor).toFixed(2)
+    : +(-aposta.valor).toFixed(2);
+
+  if (aposta.estado === "ganha" && !ganhou) {
+    // Era ganha, passa a perdida — remove os ganhos
+    saldo = +(saldo - aposta.valor * aposta.odd).toFixed(2);
+  } else if (aposta.estado === "perdida" && ganhou) {
+    // Era perdida, passa a ganha — adiciona os ganhos
+    saldo = +(saldo + aposta.valor * aposta.odd).toFixed(2);
+  }
+  // Se o estado não muda, o saldo fica igual
+
+  await updateDoc(doc(db, "apostas", id), {
+    estado: ganhou ? "ganha" : "perdida",
+    lucro,
+    resolvidaEm: serverTimestamp()
+  });
+  await updateDoc(doc(db, "jogadores", aposta.uid), { saldo });
+  await registarLog(`Aposta corrigida: ${jog.nome} — ${aposta.jogo} → ${ganhou ? "ganha ✅" : "perdida ❌"} (saldo: ${saldo.toFixed(2)} €)`);
+
+  // Atualiza a vista sem precisar de F5
+  renderAdminCorrigir();
+  showToast(`Aposta corrigida — saldo de ${jog.nome}: ${saldo.toFixed(2)} €`, "sucesso");
+};
+
+// ── Bloquear jogos ─────────────────────────────────────────────────────────
+async function renderAdminBloquear() {
+  const lista = $("admin-bloquear-lista");
+  if (!lista) return;
+  const snap = await getDoc(doc(db, "config", "jogos_bloqueados"));
+  const bloqueados = snap.exists() ? (snap.data().ids || []) : [];
+
+  // Agrupa apostas por jogo para mostrar jogos únicos
+  const jogos = {};
+  Object.values(allApostas).forEach(a => {
+    if (!jogos[a.jogo]) jogos[a.jogo] = a.jogo;
+  });
+  const jogosUnicos = Object.keys(jogos);
+
+  if (!jogosUnicos.length) {
+    lista.innerHTML = "<p style='font-size:13px;color:var(--acc);text-align:center;padding:.75rem'>Ainda não há jogos com apostas.</p>";
+    return;
+  }
+
+  lista.innerHTML = jogosUnicos.map(jogo => {
+    const id = btoa(jogo).slice(0, 20);
+    const bloqueado = bloqueados.includes(id);
+    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line)">
+      <span style="font-size:13px;color:#e8e7f8">${jogo}</span>
+      <button onclick="toggleBloquear('${id}', '${jogo.replace(/'/g,"\'")}')"
+        style="background:${bloqueado ? "#065f46" : "#7f1d1d"};color:#fff;border:none;border-radius:6px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer">
+        ${bloqueado ? "🔓 Desbloquear" : "🔒 Bloquear"}
+      </button>
+    </div>`;
+  }).join("");
+}
+
+window.toggleBloquear = async function(id, jogo) {
+  const ref  = doc(db, "config", "jogos_bloqueados");
+  const snap = await getDoc(ref);
+  let ids    = snap.exists() ? (snap.data().ids || []) : [];
+  if (ids.includes(id)) {
+    ids = ids.filter(i => i !== id);
+    await setDoc(ref, { ids });
+    await registarLog(`Jogo desbloqueado: ${jogo}`);
+    showToast(`🔓 ${jogo} desbloqueado.`, "sucesso");
+  } else {
+    ids.push(id);
+    await setDoc(ref, { ids });
+    await registarLog(`Jogo bloqueado: ${jogo}`);
+    showToast(`🔒 ${jogo} bloqueado.`, "sucesso");
+  }
+  renderAdminBloquear();
+};
+
+// Verifica se um jogo está bloqueado antes de aceitar apostas
+async function jogoEstaBloqueado(jogoNome) {
+  const snap = await getDoc(doc(db, "config", "jogos_bloqueados"));
+  if (!snap.exists()) return false;
+  const id = btoa(jogoNome).slice(0, 20);
+  return (snap.data().ids || []).includes(id);
+}
+
+// ── Ajustar saldos ──────────────────────────────────────────────────────────
+function renderAdminSaldos() {
+  const lista = $("admin-saldos-lista");
+  if (!lista) return;
+  const jogadores = Object.values(allJogadores);
+  if (!jogadores.length) { lista.innerHTML = "<p style='font-size:13px;color:var(--acc);text-align:center;padding:.75rem'>Sem jogadores.</p>"; return; }
+
+  lista.innerHTML = jogadores.map(j => `
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)">
+      <div style="width:28px;height:28px;border-radius:50%;background:var(--bg3);border:1px solid var(--acc);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:var(--t2);flex-shrink:0">${j.avatar}</div>
+      <span style="flex:1;font-size:13px;font-weight:600;color:#e8e7f8">${j.nome}</span>
+      <span style="font-size:13px;color:var(--acc);margin-right:8px">${j.saldo.toFixed(2)} €</span>
+      <input id="adj-${j.uid}" type="number" step="0.10" placeholder="ex: +2 ou -1"
+        style="width:100px;padding:5px 8px;background:var(--bg);border:1px solid var(--line);border-radius:6px;color:#e8e7f8;font-size:12px;outline:none">
+      <button onclick="ajustarSaldo('${j.uid}', '${j.nome}')"
+        style="background:var(--acc);color:#fff;border:none;border-radius:6px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer">Aplicar</button>
+    </div>`).join("");
+}
+
+window.ajustarSaldo = async function(uid, nome) {
+  const input = $(`adj-${uid}`);
+  const delta = parseFloat(input?.value);
+  if (isNaN(delta) || delta === 0) return showToast("Introduz um valor válido.", "erro");
+  const jog = allJogadores[uid];
+  if (!jog) return;
+  const novoSaldo = +(jog.saldo + delta).toFixed(2);
+  await updateDoc(doc(db, "jogadores", uid), { saldo: novoSaldo });
+  await registarLog(`Saldo ajustado: ${nome} ${delta > 0 ? "+" : ""}${delta.toFixed(2)} € → ${novoSaldo.toFixed(2)} €`);
+  if (input) input.value = "";
+  showToast(`Saldo de ${nome} ajustado para ${novoSaldo.toFixed(2)} €`, "sucesso");
+};
+
+// ── Histórico de apostas ────────────────────────────────────────────────────
+function renderAdminHistorico() {
+  const lista = $("admin-historico-lista");
+  if (!lista) return;
+  const apostas = Object.values(allApostas)
+    .sort((a, b) => (b.criadaEm?.seconds || 0) - (a.criadaEm?.seconds || 0));
+
+  if (!apostas.length) { lista.innerHTML = "<p style='font-size:13px;color:var(--acc);text-align:center;padding:.75rem'>Sem apostas.</p>"; return; }
+
+  lista.innerHTML = apostas.map(a => {
+    const jog  = allJogadores[a.uid];
+    const ts   = a.criadaEm?.seconds ? new Date(a.criadaEm.seconds * 1000) : new Date(a.criadaEm);
+    const data = ts.toLocaleString("pt-PT", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" });
+    return `<div style="padding:8px 0;border-bottom:1px solid var(--line)">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px">
+        <div style="width:22px;height:22px;border-radius:50%;background:var(--bg3);border:1px solid var(--acc);display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:var(--t2);flex-shrink:0">${jog?.avatar||"?"}</div>
+        <span style="font-size:12px;font-weight:600;color:var(--t2)">${jog?.nome||"?"}</span>
+        <span style="font-size:11px;color:var(--acc);margin-left:auto">${data}</span>
+        <span class="chip chip-${a.estado}" style="font-size:10px;padding:2px 7px">${a.estado}</span>
+      </div>
+      <div style="font-size:13px;color:#e8e7f8;padding-left:30px">${a.jogo}</div>
+      <div style="font-size:11px;color:var(--acc);padding-left:30px">${a.previsao.slice(0,80)}${a.previsao.length>80?"…":""} · odd ${a.odd?.toFixed?a.odd.toFixed(2):a.odd} · ${a.valor?.toFixed(2)} €</div>
+    </div>`;
+  }).join("");
+}
+
+// ── Log de atividade ────────────────────────────────────────────────────────
+async function registarLog(mensagem) {
+  const id = `log_${Date.now()}`;
+  await setDoc(doc(db, "logs", id), {
+    mensagem,
+    uid:  currentUser?.uid,
+    nome: allJogadores[currentUser?.uid]?.nome || "Admin",
+    criadaEm: serverTimestamp()
+  });
+}
+
+async function renderAdminLog() {
+  const lista = $("admin-log-lista");
+  if (!lista) return;
+  lista.innerHTML = "<p style='font-size:13px;color:var(--acc);text-align:center;padding:.75rem'>A carregar...</p>";
+  try {
+    const snap = await getDocs(query(collection(db, "logs"), orderBy("criadaEm", "desc"), limit(50)));
+    if (snap.empty) { lista.innerHTML = "<p style='font-size:13px;color:var(--acc);text-align:center;padding:.75rem'>Sem registos.</p>"; return; }
+    lista.innerHTML = snap.docs.map(d => {
+      const log  = d.data();
+      const ts   = log.criadaEm?.seconds ? new Date(log.criadaEm.seconds * 1000) : new Date();
+      const data = ts.toLocaleString("pt-PT", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit" });
+      return `<div style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)">
+        <span style="font-size:11px;color:var(--acc);flex-shrink:0;margin-top:2px">${data}</span>
+        <span style="font-size:13px;color:#e8e7f8">${log.mensagem}</span>
+      </div>`;
+    }).join("");
+  } catch(e) {
+    lista.innerHTML = `<p style='font-size:13px;color:#f87171;padding:.75rem'>${e.message}</p>`;
+  }
+}
+
+
 function renderAdminPanel() {
   const pendentes = Object.values(allApostas).filter(a => a.estado === "pendente");
   const lista = $("admin-apostas-lista");
   if (!lista) return;
 
   if (!pendentes.length) {
-    lista.innerHTML = "<p style='font-size:13px;color:#534AB7;text-align:center;padding:.75rem'>Não há apostas pendentes.</p>";
+    lista.innerHTML = "<p style='font-size:13px;color:var(--acc);text-align:center;padding:.75rem'>Não há apostas pendentes.</p>";
     return;
   }
 
   lista.innerHTML = pendentes.map(a => {
-    const jog = allJogadores[a.uid];
-    return `<div style="background:#0e0e1a;border:1px solid #2e2b54;border-radius:8px;padding:10px 12px;margin-bottom:8px">
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-        <div style="width:24px;height:24px;border-radius:50%;background:#26215C;border:1px solid #534AB7;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#AFA9EC;flex-shrink:0">${jog?.avatar || "?"}</div>
-        <span style="font-size:12px;font-weight:600;color:#AFA9EC">${jog?.nome || "?"}</span>
+    const jog     = allJogadores[a.uid];
+    const temSels = a.apostas && a.apostas.length > 0;
+    const tipo    = a.apostas?.length > 1 ? `Múltipla ${a.apostas.length}×` : "Simples";
+
+    const selsHTML = temSels ? a.apostas.map((s, i) => {
+      const st      = s.estadoSel || "pendente";
+      const icClass = st === "ganha" ? "ti-check" : st === "perdida" ? "ti-x" : "ti-clock";
+      const stClass = st === "ganha" ? "won" : st === "perdida" ? "lost" : "pend";
+      const btns    = st === "pendente" ? `
+        <button onclick="window.resolverSelecao('${a.id}',${i},true)"  class="sel-btn-win">✓</button>
+        <button onclick="window.resolverSelecao('${a.id}',${i},false)" class="sel-btn-lose">✗</button>` : `<div style="width:60px"></div>`;
+      return `<div class="adm-sel-row">
+        <div class="adm-sel-ic ${stClass}"><i class="ti ${icClass}" style="font-size:9px" aria-hidden="true"></i></div>
+        <div class="adm-sel-info">
+          <div class="adm-sel-game">${s.jogo}</div>
+          <div class="adm-sel-pred">${s.previsao}</div>
+        </div>
+        <div class="adm-sel-odd">×${s.odd}</div>
+        <div class="adm-sel-btns">${btns}</div>
+      </div>`;
+    }).join("") : `<div class="adm-sel-row">
+      <div class="adm-sel-ic pend"><i class="ti ti-clock" style="font-size:9px" aria-hidden="true"></i></div>
+      <div class="adm-sel-info">
+        <div class="adm-sel-game">${a.jogo}</div>
+        <div class="adm-sel-pred">${a.previsao?.slice(0,80)}${(a.previsao?.length||0)>80?"…":""}</div>
       </div>
-      <div style="font-size:13px;font-weight:600;color:#e8e7f8;margin-bottom:2px">${a.jogo}</div>
-      <div style="font-size:12px;color:#7F77DD;margin-bottom:8px">${a.previsao.slice(0,80)}${a.previsao.length>80?"…":""} · odd ${a.odd?.toFixed?a.odd.toFixed(2):a.odd} · ${a.valor?.toFixed(2)} €</div>
-      <div style="display:flex;gap:6px">
-        <button onclick="resolverAposta('${a.id}',true)" style="flex:1;background:#065f46;color:#fff;border:none;border-radius:6px;padding:7px;font-size:12px;font-weight:600;cursor:pointer">✅ Ganha</button>
-        <button onclick="resolverAposta('${a.id}',false)" style="flex:1;background:#7f1d1d;color:#fff;border:none;border-radius:6px;padding:7px;font-size:12px;font-weight:600;cursor:pointer">❌ Perdida</button>
+      <div class="adm-sel-odd">×${a.odd?.toFixed?a.odd.toFixed(2):a.odd}</div>
+      <div class="adm-sel-btns">
+        <button onclick="resolverAposta('${a.id}',true)"  class="sel-btn-win">✓</button>
+        <button onclick="resolverAposta('${a.id}',false)" class="sel-btn-lose">✗</button>
       </div>
     </div>`;
-  }).join("");
-}
+
+    return `<div class="adm-bet-card">
+      <div class="adm-bet-head">
+        <div class="adm-bet-av">${jog?.avatar||"?"}</div>
+        <div class="adm-bet-player">${jog?.nome||"?"}</div>
+        <span class="adm-bet-type">${tipo}</span>
+        <div class="adm-bet-val">${a.valor?.toFixed(2)} € · odd ${a.odd?.toFixed?a.odd.toFixed(2):a.odd}</div>
+      </div>
+      <div class="adm-bet-body">
+        ${selsHTML}
+        <div class="adm-bet-actions">
+          <button onclick="resolverAposta('${a.id}',true)"  class="adm-btn-win">Toda ganha</button>
+          <button onclick="resolverAposta('${a.id}',false)" class="adm-btn-lose">Perdida</button>
+        </div>
+      </div>
+    </div>`;
+  }).join("")
+
+window.resolverSelecao = async function(apostaId, selIdx, ganhou) {
+  if (!isAdmin()) return;
+  const ap = Object.values(allApostas).find(a => a.id === apostaId);
+  if (!ap || !ap.apostas) return;
+
+  const apostasAtualizadas = ap.apostas.map((s, i) =>
+    i === selIdx ? { ...s, estadoSel: ganhou ? "ganha" : "perdida" } : s
+  );
+
+  // Verifica se todas estão resolvidas
+  const todasResolvidas = apostasAtualizadas.every(s => s.estadoSel && s.estadoSel !== "pendente");
+  const algumaPerdida   = apostasAtualizadas.some(s => s.estadoSel === "perdida");
+
+  const updates = { apostas: apostasAtualizadas };
+
+  if (todasResolvidas) {
+    const ganhouTudo = !algumaPerdida;
+    const lucro = ganhouTudo
+      ? +(ap.valor * ap.odd - ap.valor).toFixed(2)
+      : +(-ap.valor).toFixed(2);
+    updates.estado      = ganhouTudo ? "ganha" : "perdida";
+    updates.lucro       = lucro;
+    updates.resolvidaEm = serverTimestamp();
+    if (ganhouTudo) {
+      const jog = allJogadores[ap.uid];
+      if (jog) await updateDoc(doc(db, "jogadores", ap.uid), {
+        saldo: +(jog.saldo + ap.valor * ap.odd).toFixed(2)
+      });
+    }
+    await registarLog(`Múltipla ${ganhouTudo ? "ganha ✅" : "perdida ❌"}: ${Object.values(allJogadores).find(j=>j.uid===ap.uid)?.nome} — ${ap.jogo}`);
+    showToast(ganhouTudo ? "✅ Múltipla ganha!" : "❌ Múltipla perdida.", ganhouTudo ? "sucesso" : "erro");
+  } else {
+    showToast(ganhou ? "✅ Seleção marcada como ganha" : "❌ Seleção marcada como perdida", ganhou ? "sucesso" : "erro");
+  }
+
+  await updateDoc(doc(db, "apostas", ap.id), updates);
+};
 
 window.resolverAposta = async function(id, ganhou) {
   const aposta = allApostas[id];
@@ -830,6 +1619,7 @@ window.resolverAposta = async function(id, ganhou) {
       saldo: +(jog.saldo + aposta.valor * aposta.odd).toFixed(2)
     });
   }
+  await registarLog(`Aposta ${ganhou ? "ganha ✅" : "perdida ❌"}: ${jog.nome} — ${aposta.jogo} (${lucro > 0 ? "+" : ""}${lucro.toFixed(2)} €)`);
   showToast(ganhou ? `✅ Aposta de ${jog.nome} marcada como ganha!` : `❌ Aposta de ${jog.nome} marcada como perdida.`, ganhou ? "sucesso" : "erro");
 };
 
@@ -850,5 +1640,3 @@ window.eliminarPerfis = async function() {
   showToast("Todos os perfis eliminados.", "sucesso");
 };
 
-// ─── INIT ─────────────────────────────────────────────────────────────────
-// Auth state handles initialization
